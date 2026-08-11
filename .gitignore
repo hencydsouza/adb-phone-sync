@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Git worktrees (superpowers:using-git-worktrees)
+.worktrees
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
