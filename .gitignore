@@ -15,6 +15,7 @@ dist-ssr
 # PyInstaller build output (scripts/build-adbsync.ps1)
 /build
 *.spec
+src-tauri/binaries/*
 
 # Git worktrees (superpowers:using-git-worktrees)
 .worktrees
