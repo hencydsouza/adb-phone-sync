@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# PyInstaller build output (scripts/build-adbsync.ps1)
+/build
+*.spec
+
 # Git worktrees (superpowers:using-git-worktrees)
 .worktrees
 
