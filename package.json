@@ -13,6 +13,9 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@astryxdesign/cli": "^0.3.0",
+    "@astryxdesign/core": "^0.3.0",
+    "@astryxdesign/theme-neutral": "^0.3.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
@@ -28,5 +31,9 @@
     "typescript": "~5.8.3",
     "ultracite": "7.10.2",
     "vite": "^7.0.4"
-  }
+  },
+  "trustedDependencies": [
+    "@astryxdesign/cli",
+    "@astryxdesign/core"
+  ]
 }
