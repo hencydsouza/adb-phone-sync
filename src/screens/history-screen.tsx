@@ -175,6 +175,13 @@ function deriveFolderSyncStatus(
  * the kind of concurrent DB access that could interleave with an in-progress
  * run's `persistRunResult` transaction. Callers of this function are
  * responsible for not polling it aggressively (see `HistoryScreen` below).
+ *
+ * No `.limit()`/pagination on any of the three queries, and `CollapsibleGroup`
+ * below renders every run unbounded -- fine for this app's v1 scope (one-shot
+ * manual runs, personal use, a handful of runs/folders at most), but the
+ * `inArray(runItems.runId, runIds)` call would need chunking (or this whole
+ * function would need real pagination) well before `runIds` approaches
+ * SQLite's default bound-parameter ceiling. Known follow-up, not a v1 fix.
  */
 async function loadHistory(serial: string | undefined): Promise<{
   runsList: Run[];
@@ -428,13 +435,26 @@ export function HistoryScreen({ serial }: HistoryScreenProps = {}) {
 
       <VStack gap={2}>
         <Heading level={2}>Folder sync status</Heading>
-        {folderSyncRows.length === 0 ? (
+        {/* isLoading/error-gated the same way "Past runs" below is: don't
+         * flash the "no selections" empty state while the fetch is still in
+         * flight (folderSyncRows starts as [] on mount), and don't show it
+         * at the same time as the "Failed to load history" Banner above --
+         * those two messages contradict each other ("nothing exists" vs.
+         * "we don't know"). If a refresh fails after a prior successful
+         * load, the stale folderSyncRows from that load stays visible
+         * alongside the error Banner, same as "Past runs" does for
+         * runsList. */}
+        {isLoading && folderSyncRows.length === 0 ? (
+          <Text color="secondary">Loading…</Text>
+        ) : null}
+        {!(isLoading || error) && folderSyncRows.length === 0 ? (
           <Text color="secondary" type="supporting">
             No saved folder selections yet — this is expected until a
             Classification screen save actually persists to `folder_rules` (Task
             12 left that persistence step as a placeholder).
           </Text>
-        ) : (
+        ) : null}
+        {folderSyncRows.length > 0 ? (
           <>
             {notSyncedCount > 0 ? (
               <Banner
@@ -471,7 +491,7 @@ export function HistoryScreen({ serial }: HistoryScreenProps = {}) {
               ))}
             </List>
           </>
-        )}
+        ) : null}
       </VStack>
 
       <VStack gap={2}>

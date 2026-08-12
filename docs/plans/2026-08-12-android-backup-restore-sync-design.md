@@ -156,6 +156,11 @@ plugin's `rusqlite`-backed connection over IPC).
 - **History** — `runs`/`run_items` directly; a run list view is just a query.
 - **Not-synced** — a path in `folder_rules` with `decision = include` and no
   matching `run_items` row.
+  _Implementation note (Task 14, `history-screen.tsx`):_ implemented as no
+  matching `run_items` row with `status = synced`, not literally "no matching
+  row of any status" — an `error` row's `finished_at` marks a failed attempt,
+  not a successful sync, so counting it would misreport a broken path as
+  freshly synced. Same underlying concept, refined at implementation time.
 - **Outdated** — `adbsync` itself re-transfers a changed file at run time; we
   record `outdated → synced` for that path in that run's `run_items`, so "was
   this outdated last run" is visible in history without re-deriving it.
