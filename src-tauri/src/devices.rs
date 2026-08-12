@@ -1,4 +1,12 @@
+use std::time::Duration;
+use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
+
+/// Bound on how long we wait for `adb devices -l` to finish. Device listing
+/// is a cheap, local operation, so a few seconds is generous; this exists
+/// purely to guarantee the awaited Tauri command always resolves instead of
+/// hanging forever if the sidecar process ever gets stuck.
+const LIST_DEVICES_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(serde::Serialize, Debug, PartialEq, Eq)]
 pub struct Device {
@@ -12,6 +20,10 @@ pub fn parse_adb_devices_output(raw: &str) -> Vec<Device> {
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
             let serial = parts.next()?;
+            // NOTE: this only takes the second whitespace-separated token as
+            // the state, so multi-word adb states (e.g. "no permissions
+            // (missing udev rules?)") get truncated to just "no". Not
+            // handled today; revisit if we need to surface those states.
             let state = parts.next()?;
             Some(Device {
                 serial: serial.to_string(),
@@ -23,7 +35,12 @@ pub fn parse_adb_devices_output(raw: &str) -> Vec<Device> {
 
 #[tauri::command]
 pub async fn list_devices(app: tauri::AppHandle) -> Result<Vec<Device>, String> {
-    let (mut rx, _child) = app
+    // NOTE: the `shell:allow-execute` scope entry in capabilities/default.json
+    // only gates shell invocations initiated from frontend JS through the
+    // shell plugin's JS API. It does not gate this Rust-side
+    // `Shell::sidecar()` call — removing that capability entry would not
+    // change anything for this command.
+    let (mut rx, child) = app
         .shell()
         .sidecar("adb")
         .map_err(|e| e.to_string())?
@@ -31,13 +48,51 @@ pub async fn list_devices(app: tauri::AppHandle) -> Result<Vec<Device>, String> 
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    let mut output = String::new();
-    while let Some(event) = rx.recv().await {
-        if let tauri_plugin_shell::process::CommandEvent::Stdout(bytes) = event {
-            output.push_str(&String::from_utf8_lossy(&bytes));
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    let receive_result = tokio::time::timeout(LIST_DEVICES_TIMEOUT, async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(bytes) => {
+                    stdout.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                CommandEvent::Stderr(bytes) => {
+                    stderr.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                CommandEvent::Error(err) => {
+                    stderr.push_str(&err);
+                }
+                CommandEvent::Terminated(payload) => {
+                    return Some(payload.code);
+                }
+                _ => {}
+            }
+        }
+        // Channel closed without ever seeing a Terminated event — treat as
+        // failure rather than silently returning an empty device list.
+        None
+    })
+    .await;
+
+    match receive_result {
+        Ok(Some(Some(0))) => Ok(parse_adb_devices_output(&stdout)),
+        Ok(Some(code)) => Err(format!(
+            "adb devices exited with code {code:?}: {}",
+            stderr.trim()
+        )),
+        Ok(None) => Err(format!(
+            "adb devices process ended unexpectedly: {}",
+            stderr.trim()
+        )),
+        Err(_) => {
+            // Timed out waiting for the process to finish; kill it so it
+            // doesn't linger, and surface the hang as an error instead of
+            // leaving the frontend awaiting forever.
+            let _ = child.kill();
+            Err("timed out waiting for `adb devices` to respond".to_string())
         }
     }
-    Ok(parse_adb_devices_output(&output))
 }
 
 #[cfg(test)]
