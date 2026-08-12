@@ -20,6 +20,7 @@ pub fn run() {
             greet,
             devices::list_devices,
             device_scan::classify_suggest,
+            space::space_check,
             sync::orchestration::run_backup,
             sync::orchestration::run_restore
         ])
