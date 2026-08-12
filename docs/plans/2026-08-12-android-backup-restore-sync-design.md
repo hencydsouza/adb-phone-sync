@@ -152,7 +152,11 @@ plugin's `rusqlite`-backed connection over IPC).
   `error_message`, `finished_at`
 
 **Deriving displayed status:**
-- **Last synced** — `MAX(finished_at)` from `run_items` for a given path.
+- **Last synced** — `MAX(finished_at)` from `run_items` for a given path
+  _where `status = synced`_, not any-status — an `error` row's `finished_at`
+  marks when the attempt failed, not when the path was last successfully
+  synced, so it's excluded from the `MAX()`. See the "Not-synced" note below
+  for the same status filter applied to the sibling case.
 - **History** — `runs`/`run_items` directly; a run list view is just a query.
 - **Not-synced** — a path in `folder_rules` with `decision = include` and no
   matching `run_items` row.

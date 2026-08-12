@@ -499,7 +499,7 @@ export function HistoryScreen({ serial }: HistoryScreenProps = {}) {
         {isLoading && runsList.length === 0 ? (
           <Text color="secondary">Loading…</Text>
         ) : null}
-        {!isLoading && runsList.length === 0 ? (
+        {!(isLoading || error) && runsList.length === 0 ? (
           <EmptyState
             description="Backup/restore runs will show up here once you start one from the Run screen."
             title="No runs yet"
