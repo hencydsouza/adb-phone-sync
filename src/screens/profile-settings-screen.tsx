@@ -59,7 +59,12 @@ export function ProfileSettingsScreen() {
   const [drafts, setDrafts] = useState<Record<string, DeviceDraft>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [savingSerial, setSavingSerial] = useState<string | null>(null);
+  // A set (not a single scalar) so saving one device's card doesn't clear
+  // another's in-flight "Saving…" state -- e.g. clicking Save on device B
+  // while device A's save is still in flight must leave A's button spinning.
+  const [savingSerials, setSavingSerials] = useState<ReadonlySet<string>>(
+    new Set()
+  );
   const [saveErrorBySerial, setSaveErrorBySerial] = useState<
     Record<string, string>
   >({});
@@ -136,7 +141,7 @@ export function ProfileSettingsScreen() {
       if (!draft) {
         return;
       }
-      setSavingSerial(serial);
+      setSavingSerials((prev) => new Set(prev).add(serial));
       setSavedSerial(null);
       setSaveErrorBySerial((prev) => {
         if (!(serial in prev)) {
@@ -169,7 +174,14 @@ export function ProfileSettingsScreen() {
           }));
         })
         .finally(() => {
-          setSavingSerial((prev) => (prev === serial ? null : prev));
+          setSavingSerials((prev) => {
+            if (!prev.has(serial)) {
+              return prev;
+            }
+            const next = new Set(prev);
+            next.delete(serial);
+            return next;
+          });
         });
     },
     [drafts]
@@ -223,7 +235,7 @@ export function ProfileSettingsScreen() {
               device={device}
               draft={drafts[device.serial] ?? seedDraft(device)}
               isSaved={savedSerial === device.serial}
-              isSaving={savingSerial === device.serial}
+              isSaving={savingSerials.has(device.serial)}
               key={device.serial}
               onDraftChange={handleDraftChange}
               onSave={handleSave}
