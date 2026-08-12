@@ -30,6 +30,13 @@ const CLOUD_SYNC_MARKERS: &[&str] = &["OneDrive", "Dropbox", "Google Drive", "iC
 
 /// `true` if `path` appears to be inside a cloud-sync client's managed
 /// folder, based on a substring match against [`CLOUD_SYNC_MARKERS`].
+///
+/// This is a raw, case-sensitive substring match with no path
+/// canonicalization: a symlinked/junctioned cloud-sync folder under a
+/// different name, or a differently-cased path, will silently produce a
+/// false negative (no warning shown). Acceptable for a "warn, don't block"
+/// preflight check, but callers should not assume this is a fully robust
+/// detection.
 pub fn is_cloud_synced_path(path: &str) -> bool {
     CLOUD_SYNC_MARKERS.iter().any(|marker| path.contains(marker))
 }
@@ -51,6 +58,16 @@ mod tests {
     }
 
     #[test]
+    fn fails_when_free_space_exactly_equals_estimate() {
+        // Exactly-equal is an intentional design decision (strict `>`, not
+        // `>=`): consuming every last free byte leaves zero margin for
+        // filesystem metadata overhead or estimate drift, so it must be
+        // treated as NOT enough space.
+        let result = check_space(10_000, 10_000);
+        assert!(!result.has_enough_space);
+    }
+
+    #[test]
     fn detects_onedrive_paths() {
         assert!(is_cloud_synced_path(r"C:\Users\hency\OneDrive\Desktop\nothing2a"));
         assert!(!is_cloud_synced_path(r"D:\Backups\phone"));
@@ -59,5 +76,15 @@ mod tests {
     #[test]
     fn detects_dropbox_paths() {
         assert!(is_cloud_synced_path(r"C:\Users\hency\Dropbox\phone"));
+    }
+
+    #[test]
+    fn detects_google_drive_paths() {
+        assert!(is_cloud_synced_path(r"C:\Users\hency\Google Drive\phone"));
+    }
+
+    #[test]
+    fn detects_icloud_drive_paths() {
+        assert!(is_cloud_synced_path(r"C:\Users\hency\iCloudDrive\phone"));
     }
 }
