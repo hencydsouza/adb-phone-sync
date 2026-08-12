@@ -13,6 +13,11 @@
           "name": "adb",
           "sidecar": true,
           "args": ["devices", "-l"]
+        },
+        {
+          "name": "adbsync",
+          "sidecar": true,
+          "args": true
         }
       ]
     },
