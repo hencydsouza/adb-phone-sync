@@ -52,6 +52,16 @@ pub async fn list_devices(app: tauri::AppHandle) -> Result<Vec<Device>, String> 
     let mut stderr = String::new();
 
     let receive_result = tokio::time::timeout(LIST_DEVICES_TIMEOUT, async {
+        // `Terminated` is emitted by a separate OS thread (the blocking
+        // `child.wait()`) racing against the stdout/stderr pipe-reader
+        // threads onto the same channel — there's no guarantee all buffered
+        // Stdout chunks have been delivered by the time `Terminated` shows
+        // up. So we only *record* the exit code here and keep draining the
+        // loop; it only ends naturally once `rx.recv()` returns `None`,
+        // i.e. once every sender (pipe readers included) has been dropped
+        // and all output has actually been received. This mirrors
+        // `Command::output()`'s own pattern in tauri-plugin-shell.
+        let mut exit_code: Option<Option<i32>> = None;
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(bytes) => {
@@ -64,14 +74,14 @@ pub async fn list_devices(app: tauri::AppHandle) -> Result<Vec<Device>, String> 
                     stderr.push_str(&err);
                 }
                 CommandEvent::Terminated(payload) => {
-                    return Some(payload.code);
+                    exit_code = Some(payload.code);
                 }
                 _ => {}
             }
         }
         // Channel closed without ever seeing a Terminated event — treat as
         // failure rather than silently returning an empty device list.
-        None
+        exit_code
     })
     .await;
 
