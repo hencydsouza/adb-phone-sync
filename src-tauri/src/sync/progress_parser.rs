@@ -13,8 +13,9 @@
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum ProgressEvent {
-    /// A file is actively being transferred. `path` is the on-device (pull)
-    /// or destination (push) path as printed by `adb` itself.
+    /// A file is actively being transferred. `path` is the device-side path
+    /// (source for a pull, destination for a push) as printed by `adb`
+    /// itself in its `"[%3d%%] %s"` progress line.
     Copying { path: String },
     /// adbsync hit an unrecoverable condition and is about to exit
     /// (`logging_fatal` / `logging.critical` in the Python source).
@@ -32,6 +33,21 @@ pub enum ProgressEvent {
 /// oversight.
 pub fn parse_line(line: &str) -> Option<ProgressEvent> {
     let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    // adb's real progress display redraws in place using `\r` (not `\n`)
+    // between percentage updates for the same file. If the caller's stream
+    // splitter is `\n`-only (e.g. a naive `BufReader::lines()`), multiple
+    // redraw updates for one file can arrive concatenated into a single
+    // "line" containing embedded `\r`s, e.g.
+    // `"[  1%] IMG.jpg\r[ 45%] IMG.jpg\r[100%] IMG.jpg"`. Only the text
+    // after the LAST `\r` is the most recent update; keep that and discard
+    // the stale prefix so it can never leak into a parsed field (e.g.
+    // `path`). This is a no-op whenever `\r` isn't embedded, which covers
+    // every real line we've seen so far.
+    let line = line.rsplit('\r').next().unwrap_or(line).trim();
     if line.is_empty() {
         return None;
     }
@@ -179,6 +195,33 @@ mod tests {
                     .into()
             })
         );
+    }
+
+    #[test]
+    fn embedded_carriage_returns_from_concatenated_redraws_keep_only_the_latest_update() {
+        // adb redraws its progress line in place using `\r`, not `\n`,
+        // between percentage updates for the same file. If a future `\n`-only
+        // stream splitter ever concatenates several redraws into one "line",
+        // this must still extract just the LAST (most recent) update rather
+        // than corrupting `path` with the stale prefix.
+        let events =
+            parse_line("[  1%] IMG.jpg\r[ 45%] IMG.jpg\r[100%] IMG.jpg");
+        assert_eq!(
+            events,
+            Some(ProgressEvent::Copying {
+                path: "IMG.jpg".into()
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_a_bracket_line_with_a_non_numeric_percent() {
+        assert_eq!(parse_line("[abc%] file"), None);
+    }
+
+    #[test]
+    fn ignores_a_bracket_line_with_no_trailing_path() {
+        assert_eq!(parse_line("[ 45%]"), None);
     }
 
     #[test]
