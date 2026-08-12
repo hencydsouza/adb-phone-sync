@@ -284,7 +284,8 @@ function DeviceProfileCard({
   const isDirty =
     draft.displayName.trim() !== device.displayName ||
     draft.destinationPath.trim() !== (device.destinationPath ?? "");
-  const isSaveDisabled = isSaving || draft.displayName.trim().length === 0;
+  const isSaveDisabled =
+    isSaving || draft.displayName.trim().length === 0 || !isDirty;
 
   return (
     <Card padding={4}>
