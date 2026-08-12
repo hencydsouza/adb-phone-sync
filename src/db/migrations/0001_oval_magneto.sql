@@ -1,0 +1,1 @@
+ALTER TABLE `devices` ADD `destination_path` text;

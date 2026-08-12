@@ -7,6 +7,13 @@ import {
 } from "drizzle-orm/sqlite-core";
 
 export const devices = sqliteTable("devices", {
+  // Nullable: no task before Task 15 (Profile settings) ever writes this --
+  // `run-screen.tsx`'s `persistRunResult` only upserts `displayName`/
+  // `lastSeen`, and its `dest` field is a per-run form value, never
+  // persisted. This column lets a device's chosen backup destination survive
+  // across runs once a user sets it from the Profile settings screen; it's
+  // NULL for every device until they do.
+  destinationPath: text("destination_path"),
   displayName: text("display_name").notNull(),
   firstSeen: integer("first_seen", { mode: "timestamp" }).notNull(),
   lastSeen: integer("last_seen", { mode: "timestamp" }).notNull(),
