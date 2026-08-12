@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod classify;
+mod device_scan;
 mod devices;
 mod space;
 mod sync;
@@ -18,6 +19,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             devices::list_devices,
+            device_scan::classify_suggest,
             sync::orchestration::run_backup,
             sync::orchestration::run_restore
         ])
