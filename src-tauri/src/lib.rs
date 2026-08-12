@@ -1,6 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod classify;
 mod devices;
+mod space;
 mod sync;
 
 #[tauri::command]
