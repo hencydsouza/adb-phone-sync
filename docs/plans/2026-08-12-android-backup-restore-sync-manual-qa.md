@@ -177,6 +177,11 @@ check each for basic usability now that Section 1 makes them reachable.
       device works, and the async-state/lifted-selection fixes from
       `e07f90c` hold up (rapidly switching devices doesn't leave stale
       state).
+- [ ] **Device screen, disconnected state.** Unplug/authorize-revoke the
+      device and reload — confirm the "no devices connected" `EmptyState`
+      renders correctly (this was an explicit manual-verification step in
+      the original Task 11 plan that never got exercised against the real
+      compiled app).
 - [ ] **Classification screen.** Suggestions come from the real
       `classify_suggest` command (already verified against a real device's
       `ls -la` output per `41c2f6a` — no need to re-verify the parsing
