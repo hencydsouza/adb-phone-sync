@@ -152,21 +152,52 @@ async fn run_adb_shell_du(
     .await;
 
     match receive_result {
-        Ok(Some(Some(0))) => parse_du_output(&stdout, path),
-        Ok(Some(code)) => Err(format!(
-            "adb shell du -s {path} exited with code {code:?}: {}",
-            stderr.trim()
-        )),
-        Ok(None) => Err(format!(
-            "adb shell du -s {path} process ended unexpectedly: {}",
-            stderr.trim()
-        )),
+        Ok(exit_code) => interpret_du_exit(exit_code, &stdout, &stderr, path),
         Err(_) => {
             let _ = child.kill();
             Err(format!(
                 "timed out waiting for `adb shell du -s {path}` to respond"
             ))
         }
+    }
+}
+
+/// Interpret the drained `adb shell du -s <path>` event-channel outcome
+/// (exit code, stdout, stderr) into a byte count or an error. Pulled out of
+/// [`run_adb_shell_du`] as a pure function so this decision logic -- notably
+/// the defensive stderr-even-on-exit-0 check below -- can be unit tested
+/// without a real `AppHandle`/subprocess.
+///
+/// Defensive: don't trust exit code 0 alone. `du -s` walking into a
+/// permission-restricted subtree (e.g. `Android/data`/`Android/obb` -- see
+/// `docs/research/adbsync-tooling.md`'s Bug 2, and `progress_parser.rs`'s
+/// handling of the same underlying `Permission denied` condition) may route
+/// the error to stderr only, without necessarily causing a non-zero exit --
+/// toybox `du`'s exit code is not guaranteed to reflect a partial walk.
+/// Treating any captured stderr as a failure, even alongside a clean exit
+/// code, guards against silently under-counting `estimated_bytes` with a
+/// partial total instead of failing the whole estimate as documented on
+/// [`estimate_size_bytes`].
+fn interpret_du_exit(
+    exit_code: Option<Option<i32>>,
+    stdout: &str,
+    stderr: &str,
+    path: &str,
+) -> Result<u64, String> {
+    match exit_code {
+        Some(Some(0)) if !stderr.trim().is_empty() => Err(format!(
+            "adb shell du -s {path} exited 0 but reported errors on stderr (likely a partial/inaccurate size due to a permission-restricted subfolder): {}",
+            stderr.trim()
+        )),
+        Some(Some(0)) => parse_du_output(stdout, path),
+        Some(code) => Err(format!(
+            "adb shell du -s {path} exited with code {code:?}: {}",
+            stderr.trim()
+        )),
+        None => Err(format!(
+            "adb shell du -s {path} process ended unexpectedly: {}",
+            stderr.trim()
+        )),
     }
 }
 
@@ -368,5 +399,62 @@ mod tests {
             "/storage/emulated/0/NoSuchFolder"
         )
         .is_err());
+    }
+
+    #[test]
+    fn exit_zero_with_clean_stdout_and_no_stderr_succeeds() {
+        // The ordinary, fully-accessible-folder case: exit 0, no stderr.
+        let result = interpret_du_exit(
+            Some(Some(0)),
+            "28946919\t/storage/emulated/0/DCIM\n",
+            "",
+            "/storage/emulated/0/DCIM",
+        );
+        assert_eq!(result, Ok(28_946_919 * 1024));
+    }
+
+    /// Locks in the defensive fix for the real risk this whole module's
+    /// "fail-whole-estimate" guarantee exists to guard against (see
+    /// `docs/research/adbsync-tooling.md`'s Bug 2): `du -s` walking into a
+    /// permission-restricted subtree like `Android/data`/`Android/obb` can
+    /// exit 0 with a PARTIAL total on stdout while routing the permission
+    /// error to stderr only -- many `du` implementations (including
+    /// toybox's on Android) don't reliably turn that into a non-zero exit
+    /// code. Without this check, `estimate_size_bytes` would silently
+    /// UNDER-COUNT instead of failing, which is the opposite of what
+    /// `estimate_size_bytes`'s doc comment claims to guarantee. Can't be
+    /// live-tested without a real permission-restricted device path (not
+    /// available in this sandboxed environment), so this simulates the
+    /// scenario directly: zero exit code + non-empty stderr must still be
+    /// treated as a failure, even though `stdout` alone would parse fine.
+    #[test]
+    fn exit_zero_with_stderr_output_is_treated_as_a_failure() {
+        let result = interpret_du_exit(
+            Some(Some(0)),
+            "12345\t/storage/emulated/0\n",
+            "du: /storage/emulated/0/Android/data/org.videolan.vlc/files: Permission denied\n",
+            "/storage/emulated/0",
+        );
+        assert!(result.is_err());
+        let message = result.unwrap_err();
+        assert!(message.contains("exited 0 but reported errors on stderr"));
+        assert!(message.contains("Permission denied"));
+    }
+
+    #[test]
+    fn nonzero_exit_is_an_error_regardless_of_stderr_content() {
+        let result = interpret_du_exit(
+            Some(Some(1)),
+            "",
+            "du: /storage/emulated/0/NoSuchFolder: No such file or directory",
+            "/storage/emulated/0/NoSuchFolder",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_ending_without_a_terminated_event_is_an_error() {
+        let result = interpret_du_exit(None, "", "", "/storage/emulated/0/DCIM");
+        assert!(result.is_err());
     }
 }
