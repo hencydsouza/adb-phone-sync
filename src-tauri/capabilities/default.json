@@ -6,7 +6,16 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "shell:allow-execute",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "adb",
+          "sidecar": true,
+          "args": ["devices", "-l"]
+        }
+      ]
+    },
     "sql:default"
   ]
 }
