@@ -117,6 +117,11 @@ async fn run_adb_shell_du(
     serial: &str,
     path: &str,
 ) -> Result<u64, String> {
+    // NOTE: see the `shell:allow-execute` scope note on
+    // `devices::list_devices` -- it doesn't gate this Rust-side
+    // `Shell::sidecar()` call either, which is why the capability's `adb`
+    // entry uses unrestricted `"args": true` rather than pinning it to one
+    // command's args.
     let (mut rx, child) = app
         .shell()
         .sidecar("adb")
@@ -287,6 +292,12 @@ pub async fn space_check(
     dest: String,
     included_paths: Vec<String>,
 ) -> Result<SpaceCheckResult, String> {
+    // Same guard `run_backup`/`run_restore` apply before touching
+    // `included_paths` -- see `path_pair::validate_android_path`'s doc
+    // comment. Applied here too since a malformed path would otherwise be
+    // passed straight to `adb shell du -s <path>`.
+    crate::sync::path_pair::validate_included_paths(&included_paths)?;
+
     let estimated_bytes = estimate_size_bytes(&app, &serial, &included_paths).await?;
     let free_bytes = free_space_bytes(&dest).await?;
     let check = check_space(estimated_bytes, free_bytes);

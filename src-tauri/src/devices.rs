@@ -39,7 +39,14 @@ pub async fn list_devices(app: tauri::AppHandle) -> Result<Vec<Device>, String> 
     // only gates shell invocations initiated from frontend JS through the
     // shell plugin's JS API. It does not gate this Rust-side
     // `Shell::sidecar()` call — removing that capability entry would not
-    // change anything for this command.
+    // change anything for this command. Its `adb` entry uses `"args": true`
+    // (unrestricted) rather than pinning specific args like `["devices",
+    // "-l"]`: `space.rs` and `sync::orchestration` both invoke the same
+    // `adb` sidecar with different args (`shell du ...`, `shell -s <serial>
+    // ...`), and since this scope isn't load-bearing for any Rust-side call
+    // anyway, pinning it to one command's args would only create the false
+    // impression that `adb` is restricted to a harmless read-only
+    // invocation when it isn't.
     let (mut rx, child) = app
         .shell()
         .sidecar("adb")

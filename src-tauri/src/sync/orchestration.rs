@@ -345,7 +345,8 @@ impl RealFolderSyncRunner {
         // capabilities/default.json only gates shell invocations initiated
         // from frontend JS through the shell plugin's JS API -- it does not
         // gate this Rust-side `Shell::sidecar()` call. See the identical
-        // note on `devices::list_devices`.
+        // note (with more detail on why the `adb` entry uses unrestricted
+        // `"args": true`) on `devices::list_devices`.
         let spawn_result = self
             .app
             .shell()
@@ -528,6 +529,12 @@ async fn run_sync_batch(
     included_paths: Vec<String>,
     direction: SyncDirection,
 ) -> Result<BatchOutcome, String> {
+    // Reject a malformed included path (relative, or containing a `..`
+    // segment) before it's ever used to build a local destination path or
+    // passed to `adb`/`adbsync` -- see `path_pair::validate_android_path`'s
+    // doc comment for why `leaf_name` alone isn't a sufficient guard.
+    path_pair::validate_included_paths(&included_paths)?;
+
     let mut runner = RealFolderSyncRunner::new(app.clone(), serial, dest, direction)?;
 
     let outcome = tauri::async_runtime::spawn_blocking(move || {

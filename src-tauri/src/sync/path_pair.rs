@@ -24,6 +24,49 @@ impl PathPair {
     }
 }
 
+/// Validates that `path` is safe to use both as an `adb`/`adbsync` argument
+/// and, via [`super::orchestration`]'s `leaf_name`, to construct a local
+/// filesystem destination path (`dest_root.join(leaf_name(path))`).
+///
+/// Rejects two things:
+/// - Any path that doesn't start with `/`: these are meant to be absolute
+///   Android device paths (e.g. `/storage/emulated/0/DCIM`), never relative
+///   ones.
+/// - Any path containing a literal `..` path segment: `leaf_name` only takes
+///   the last `/`-segment of the raw string with no other validation, then
+///   joins it onto the profile's local destination root. A path that is (or
+///   ends in) a bare `..` segment could otherwise escape the chosen
+///   destination folder by one level (e.g. an included path of
+///   `/storage/emulated/0/..` would make `leaf_name` return `".."`, and
+///   `dest_root.join("..")` walks up a directory instead of writing inside
+///   it).
+///
+/// Called from the `run_backup`/`run_restore`/`space_check` Tauri commands
+/// before `included_paths` is used for anything, so a malformed path is
+/// rejected with a clear error instead of silently proceeding.
+pub fn validate_android_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!(
+            "included path {path:?} must be an absolute Android device path (starting with \"/\")"
+        ));
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        return Err(format!(
+            "included path {path:?} must not contain a \"..\" path segment"
+        ));
+    }
+    Ok(())
+}
+
+/// Runs [`validate_android_path`] over every path in `paths`, short-circuiting
+/// on the first invalid one.
+pub fn validate_included_paths(paths: &[String]) -> Result<(), String> {
+    for path in paths {
+        validate_android_path(path)?;
+    }
+    Ok(())
+}
+
 /// Appends `sep` to `path` unless it's already present.
 ///
 /// Note: this only recognizes `sep` itself as a terminator. A path that
@@ -95,6 +138,55 @@ mod tests {
         // a push-source path ending in `/` gets a redundant trailing `\`.
         let pair = build_push_pair("C:/dest/DCIM/", "/storage/emulated/0/DCIM");
         assert_eq!(pair.local(), "C:/dest/DCIM/\\");
+    }
+
+    #[test]
+    fn validate_android_path_accepts_a_normal_absolute_path() {
+        assert!(validate_android_path("/storage/emulated/0/DCIM").is_ok());
+    }
+
+    #[test]
+    fn validate_android_path_rejects_a_relative_path() {
+        let err = validate_android_path("DCIM").unwrap_err();
+        assert!(err.contains("absolute"));
+    }
+
+    #[test]
+    fn validate_android_path_rejects_a_bare_dotdot_segment() {
+        let err = validate_android_path("/storage/emulated/0/..").unwrap_err();
+        assert!(err.contains(".."));
+    }
+
+    #[test]
+    fn validate_android_path_rejects_a_dotdot_segment_in_the_middle() {
+        let err = validate_android_path("/storage/../etc").unwrap_err();
+        assert!(err.contains(".."));
+    }
+
+    #[test]
+    fn validate_android_path_accepts_a_path_containing_but_not_equal_to_dotdot() {
+        // A folder literally named e.g. "foo..bar" is a legitimate segment,
+        // distinct from a `..` traversal segment -- only an exact `..`
+        // segment should be rejected.
+        assert!(validate_android_path("/storage/emulated/0/foo..bar").is_ok());
+    }
+
+    #[test]
+    fn validate_included_paths_short_circuits_on_the_first_bad_path() {
+        let paths = vec![
+            "/storage/emulated/0/DCIM".to_string(),
+            "/storage/emulated/0/..".to_string(),
+        ];
+        assert!(validate_included_paths(&paths).is_err());
+    }
+
+    #[test]
+    fn validate_included_paths_accepts_an_all_good_list() {
+        let paths = vec![
+            "/storage/emulated/0/DCIM".to_string(),
+            "/storage/emulated/0/Pictures".to_string(),
+        ];
+        assert!(validate_included_paths(&paths).is_ok());
     }
 
     #[test]

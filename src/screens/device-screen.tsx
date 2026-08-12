@@ -8,7 +8,7 @@ import { StatusDot } from "@astryxdesign/core/StatusDot";
 import { Text } from "@astryxdesign/core/Text";
 import { VStack } from "@astryxdesign/core/VStack";
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /** Mirrors the `Device` struct serialized by `src-tauri/src/devices.rs`. */
 interface Device {
@@ -39,17 +39,26 @@ export function DeviceScreen({ onDeviceSelected }: DeviceScreenProps = {}) {
   const [error, setError] = useState<string | null>(null);
   const [selectedSerial, setSelectedSerial] = useState<string | null>(null);
 
-  // Returns a cancellation function so callers (the mount effect, in
-  // particular) can guard against setting state after the component that
-  // triggered the fetch is no longer around to receive it.
+  // Every fetch (mount AND retry) bumps a shared generation counter and
+  // checks against it before touching state, so a stale in-flight request
+  // from an earlier click/mount can never clobber state set by a newer one.
+  // Ported from `classification-screen.tsx`, which fixed this same gap after
+  // Task 11's review noted this screen's original closure-based `cancelled`
+  // flag only guarded the mount effect's own fetch -- the "Retry" buttons
+  // called `loadDevices` directly without capturing/using its returned
+  // cancel closure, so rapidly clicking Retry could let a stale response
+  // clobber a newer one.
+  const fetchGenerationRef = useRef(0);
+
   const loadDevices = useCallback(() => {
+    fetchGenerationRef.current += 1;
+    const generation = fetchGenerationRef.current;
     setIsLoading(true);
     setError(null);
-    let cancelled = false;
 
     invoke<Device[]>("list_devices")
       .then((result) => {
-        if (cancelled) {
+        if (fetchGenerationRef.current !== generation) {
           return;
         }
         setDevices(result);
@@ -62,26 +71,21 @@ export function DeviceScreen({ onDeviceSelected }: DeviceScreenProps = {}) {
         );
       })
       .catch((err: unknown) => {
-        if (cancelled) {
+        if (fetchGenerationRef.current !== generation) {
           return;
         }
         setError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
-        if (cancelled) {
+        if (fetchGenerationRef.current !== generation) {
           return;
         }
         setIsLoading(false);
       });
-
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
   useEffect(() => {
-    const cancel = loadDevices();
-    return cancel;
+    loadDevices();
   }, [loadDevices]);
 
   const handleSelect = useCallback(
