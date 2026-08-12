@@ -204,6 +204,12 @@ fn resolve_sidecar_path(name: &str) -> Result<PathBuf, String> {
             path.as_mut_os_string().push(".exe");
         }
     }
+    if !path.exists() {
+        return Err(format!(
+            "{name} sidecar not found at {} -- expected it bundled next to the app binary",
+            path.display()
+        ));
+    }
     Ok(path)
 }
 
@@ -213,6 +219,51 @@ fn resolve_sidecar_path(name: &str) -> Result<PathBuf, String> {
 fn leaf_name(android_path: &str) -> &str {
     let trimmed = android_path.trim_end_matches('/');
     trimmed.rsplit('/').next().unwrap_or(trimmed)
+}
+
+/// Decide whether a single folder's `adbsync` invocation counts as a
+/// success or failure, given how the drain loop ended.
+///
+/// `exit_code` is the (already timeout-checked) result of draining the
+/// subprocess: `Some(Some(code))` if `adbsync` reported an exit code,
+/// `Some(None)` if it was terminated without one, `None` if the event
+/// channel closed without ever seeing a `Terminated` event.
+///
+/// Deliberately NOT a pure function of the exit code alone: a zero exit
+/// code is not on its own sufficient to call the folder a success.
+/// `progress_parser::parse_line`'s `Error` variant exists precisely for
+/// lines (e.g. a bare, unwrapped `ls: ...: Permission denied`) that are
+/// non-fatal to the *process* but still must be surfaced to the user rather
+/// than silently dropped -- see that module's doc comment. If `adbsync`
+/// exits 0 but we still observed one of those (or a `Fatal`) during the
+/// drain, this reports the folder as failed using that message anyway, so a
+/// partially-broken-but-zero-exit run never gets reported as
+/// `sync-folder-success` (design doc §5: never silently report success when
+/// something went wrong).
+fn determine_folder_outcome(
+    exit_code: Option<Option<i32>>,
+    last_notable_message: Option<String>,
+    stderr_tail: &str,
+    subcommand: &str,
+) -> Result<(), String> {
+    match exit_code {
+        Some(Some(0)) => match last_notable_message {
+            None => Ok(()),
+            Some(message) => Err(message),
+        },
+        Some(code) => Err(last_notable_message.unwrap_or_else(|| {
+            format!(
+                "adbsync {subcommand} exited with code {code:?}: {}",
+                stderr_tail.trim()
+            )
+        })),
+        None => Err(last_notable_message.unwrap_or_else(|| {
+            format!(
+                "adbsync {subcommand} process ended unexpectedly: {}",
+                stderr_tail.trim()
+            )
+        })),
+    }
 }
 
 /// Real, subprocess-spawning [`FolderSyncRunner`]. Spawns the `adbsync`
@@ -371,27 +422,19 @@ impl RealFolderSyncRunner {
             Self::handle_line(&self.app, folder, &line, &mut last_notable_message);
         }
 
-        let outcome = match drain_result {
-            Ok(Some(Some(0))) => Ok(()),
-            Ok(Some(code)) => Err(last_notable_message.clone().unwrap_or_else(|| {
-                format!(
-                    "adbsync {subcommand} exited with code {code:?}: {}",
-                    stderr_tail.trim()
-                )
-            })),
-            Ok(None) => Err(last_notable_message.clone().unwrap_or_else(|| {
-                format!(
-                    "adbsync {subcommand} process ended unexpectedly: {}",
-                    stderr_tail.trim()
-                )
-            })),
-            Err(()) => {
-                let _ = child.kill();
-                Err(format!(
-                    "timed out waiting for adbsync output while syncing \"{folder}\" \
-                     (no output for {SYNC_INACTIVITY_TIMEOUT:?})"
-                ))
-            }
+        let outcome = if let Err(()) = drain_result {
+            let _ = child.kill();
+            Err(format!(
+                "timed out waiting for adbsync output while syncing \"{folder}\" \
+                 (no output for {SYNC_INACTIVITY_TIMEOUT:?})"
+            ))
+        } else {
+            determine_folder_outcome(
+                drain_result.ok().flatten(),
+                last_notable_message.take(),
+                &stderr_tail,
+                subcommand,
+            )
         };
 
         match &outcome {
@@ -564,6 +607,69 @@ mod orchestration_tests {
         assert_eq!(leaf_name("/storage/emulated/0/DCIM"), "DCIM");
         assert_eq!(leaf_name("/storage/emulated/0/DCIM/"), "DCIM");
         assert_eq!(leaf_name("DCIM"), "DCIM");
+    }
+
+    #[test]
+    fn zero_exit_with_no_notable_message_is_a_success() {
+        let outcome = determine_folder_outcome(Some(Some(0)), None, "", "pull");
+        assert_eq!(outcome, Ok(()));
+    }
+
+    #[test]
+    fn zero_exit_but_an_observed_error_event_is_still_reported_as_a_failure() {
+        // The core regression this locks in: `progress_parser::parse_line`
+        // can emit a non-fatal `ProgressEvent::Error` (e.g. a bare, unwrapped
+        // `ls: ...: Permission denied` line -- see that module's doc
+        // comment) for a process that still happens to exit 0. That must
+        // NOT be reported as `sync-folder-success`.
+        let outcome = determine_folder_outcome(
+            Some(Some(0)),
+            Some("ls: /sdcard/Android/data/foo: Permission denied".to_string()),
+            "",
+            "pull",
+        );
+        assert_eq!(
+            outcome,
+            Err("ls: /sdcard/Android/data/foo: Permission denied".to_string())
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_with_a_notable_message_uses_that_message() {
+        let outcome = determine_folder_outcome(
+            Some(Some(1)),
+            Some("adbsync: fatal error".to_string()),
+            "some stderr noise",
+            "pull",
+        );
+        assert_eq!(outcome, Err("adbsync: fatal error".to_string()));
+    }
+
+    #[test]
+    fn nonzero_exit_with_no_notable_message_falls_back_to_a_generic_message() {
+        let outcome = determine_folder_outcome(Some(Some(1)), None, "boom", "push");
+        assert_eq!(
+            outcome,
+            Err("adbsync push exited with code Some(1): boom".to_string())
+        );
+    }
+
+    #[test]
+    fn process_terminated_without_an_exit_code_is_a_failure() {
+        let outcome = determine_folder_outcome(Some(None), None, "killed", "pull");
+        assert_eq!(
+            outcome,
+            Err("adbsync pull exited with code None: killed".to_string())
+        );
+    }
+
+    #[test]
+    fn channel_closed_without_ever_seeing_terminated_is_a_failure() {
+        let outcome = determine_folder_outcome(None, None, "eof", "pull");
+        assert_eq!(
+            outcome,
+            Err("adbsync pull process ended unexpectedly: eof".to_string())
+        );
     }
 
     #[test]
