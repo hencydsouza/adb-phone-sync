@@ -230,16 +230,32 @@ fn leaf_name(android_path: &str) -> &str {
 /// channel closed without ever seeing a `Terminated` event.
 ///
 /// Deliberately NOT a pure function of the exit code alone: a zero exit
-/// code is not on its own sufficient to call the folder a success.
-/// `progress_parser::parse_line`'s `Error` variant exists precisely for
-/// lines (e.g. a bare, unwrapped `ls: ...: Permission denied`) that are
-/// non-fatal to the *process* but still must be surfaced to the user rather
-/// than silently dropped -- see that module's doc comment. If `adbsync`
-/// exits 0 but we still observed one of those (or a `Fatal`) during the
-/// drain, this reports the folder as failed using that message anyway, so a
-/// partially-broken-but-zero-exit run never gets reported as
-/// `sync-folder-success` (design doc §5: never silently report success when
-/// something went wrong).
+/// code is not on its own sufficient to call the folder a success, for two
+/// separate reasons layered on top of each other:
+///
+/// 1. `progress_parser::parse_line`'s `Error` variant exists precisely for
+///    lines (e.g. a bare, unwrapped `ls: ...: Permission denied`) that are
+///    non-fatal to the *process* but still must be surfaced to the user
+///    rather than silently dropped -- see that module's doc comment. If
+///    `adbsync` exits 0 but we still observed one of those (or a `Fatal`)
+///    during the drain, this reports the folder as failed using that
+///    message.
+/// 2. Even when nothing was recognized by `parse_line` as a notable
+///    message, ANY non-empty `stderr_tail` on an exit-0 process is still
+///    treated as a failure. This mirrors `space.rs`'s `interpret_du_exit`
+///    (hardened in commit `8877362` after Task 13's review): toybox tools on
+///    Android (`du`, `ls`, and by extension whatever `adb`/`adbsync` shell
+///    out to) don't reliably turn a partial/failed operation into a
+///    non-zero exit code, so real failure text -- e.g. "No space left on
+///    device", "Input/output error" -- can land on stderr while the process
+///    still exits 0, and none of `progress_parser`'s patterns match that
+///    text. `8877362` only patched the preflight size-estimate path in
+///    `space.rs`; this is the actual transfer path, so it needs the same
+///    fallback (see commit that introduced this comment for the fix).
+///
+/// Together these guarantee a partially-broken-but-zero-exit run never gets
+/// reported as `sync-folder-success` (design doc §5: never silently report
+/// success when something went wrong).
 fn determine_folder_outcome(
     exit_code: Option<Option<i32>>,
     last_notable_message: Option<String>,
@@ -248,8 +264,13 @@ fn determine_folder_outcome(
 ) -> Result<(), String> {
     match exit_code {
         Some(Some(0)) => match last_notable_message {
-            None => Ok(()),
             Some(message) => Err(message),
+            None if !stderr_tail.trim().is_empty() => Err(format!(
+                "adbsync {subcommand} exited 0 but reported errors on stderr (likely a \
+                 partial/failed transfer): {}",
+                stderr_tail.trim()
+            )),
+            None => Ok(()),
         },
         Some(code) => Err(last_notable_message.unwrap_or_else(|| {
             format!(
@@ -632,6 +653,30 @@ mod orchestration_tests {
             outcome,
             Err("ls: /sdcard/Android/data/foo: Permission denied".to_string())
         );
+    }
+
+    #[test]
+    fn zero_exit_with_unrecognized_stderr_text_is_still_reported_as_a_failure() {
+        // The critical regression this locks in: real disk-full/IO-error
+        // text like "No space left on device" is NOT matched by anything in
+        // `progress_parser.rs` (unlike the `[CRITICAL] ...`/`ls: ... :
+        // Permission denied` patterns covered by the test above), so
+        // `last_notable_message` stays `None` for it. Before this fix, that
+        // meant a zero exit code alone was enough to report the folder as
+        // `sync-folder-success` even though the transfer actually failed --
+        // exactly the failure mode the whole feature exists to prevent
+        // (design doc §5). Mirrors `space.rs`'s
+        // `exit_zero_with_stderr_output_is_treated_as_a_failure` test for
+        // `interpret_du_exit`.
+        let outcome = determine_folder_outcome(
+            Some(Some(0)),
+            None,
+            "No space left on device",
+            "push",
+        );
+        assert!(outcome.is_err());
+        let message = outcome.unwrap_err();
+        assert!(message.contains("No space left on device"));
     }
 
     #[test]
