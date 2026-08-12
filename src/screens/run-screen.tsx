@@ -183,51 +183,207 @@ async function persistRunResult(params: {
   const { serial, direction, startedAt, finishedAt, outcome } = params;
   const status = outcome.failed_at ? "failed" : "completed";
 
-  await db
-    .insert(devices)
-    .values({
-      displayName: serial,
-      firstSeen: startedAt,
-      lastSeen: finishedAt,
-      serial,
-    })
-    .onConflictDoUpdate({
-      set: { lastSeen: finishedAt },
-      target: devices.serial,
-    });
+  // All three writes share one transaction so a failure partway through
+  // (e.g. after the `runs` insert but before `run_items`) can never leave an
+  // orphaned `runs` row with no `run_items` -- drizzle-orm's sqlite-proxy
+  // driver issues real `begin`/`commit`/`rollback` statements over the same
+  // proxied connection (see `SQLiteRemoteSession.transaction` in
+  // `drizzle-orm/sqlite-proxy`), so this is a genuine atomic commit, not
+  // just an API nicety.
+  await db.transaction(async (tx) => {
+    await tx
+      .insert(devices)
+      .values({
+        displayName: serial,
+        firstSeen: startedAt,
+        lastSeen: finishedAt,
+        serial,
+      })
+      .onConflictDoUpdate({
+        set: { lastSeen: finishedAt },
+        target: devices.serial,
+      });
 
-  const [insertedRun] = await db
-    .insert(runs)
-    .values({
-      deviceSerial: serial,
-      finishedAt,
-      startedAt,
-      status,
-      type: direction,
-    })
-    .returning({ id: runs.id });
+    const [insertedRun] = await tx
+      .insert(runs)
+      .values({
+        deviceSerial: serial,
+        finishedAt,
+        startedAt,
+        status,
+        type: direction,
+      })
+      .returning({ id: runs.id });
 
-  const itemRows: (typeof runItems.$inferInsert)[] = outcome.completed.map(
-    (path) => ({
-      finishedAt,
-      path,
-      runId: insertedRun.id,
-      status: "synced",
-    })
-  );
-  if (outcome.failed_at) {
-    const [failedPath, message] = outcome.failed_at;
-    itemRows.push({
-      errorMessage: message,
-      finishedAt,
-      path: failedPath,
-      runId: insertedRun.id,
-      status: "error",
-    });
+    const itemRows: (typeof runItems.$inferInsert)[] = outcome.completed.map(
+      (path) => ({
+        finishedAt,
+        path,
+        runId: insertedRun.id,
+        status: "synced",
+      })
+    );
+    if (outcome.failed_at) {
+      const [failedPath, message] = outcome.failed_at;
+      itemRows.push({
+        errorMessage: message,
+        finishedAt,
+        path: failedPath,
+        runId: insertedRun.id,
+        status: "error",
+      });
+    }
+
+    if (itemRows.length > 0) {
+      await tx.insert(runItems).values(itemRows);
+    }
+  });
+}
+
+/**
+ * Registers the 4 per-run progress event listeners and returns however many
+ * of them succeeded, plus any failure messages. Pulled out of `handleStart`
+ * both to keep that callback's cognitive complexity within lint limits and
+ * so the "some listeners failed" bookkeeping (§ below) lives in one place.
+ *
+ * Deliberately uses `Promise.allSettled` rather than `Promise.all`:
+ * `Promise.all` fails fast on the first rejected `listen()` call and
+ * discards the settled results of the others -- but those other `listen()`
+ * calls still resolve independently in the background regardless, so their
+ * unlisten functions would be silently lost (a real listener leak) while the
+ * caller never even learns setup failed. `Promise.allSettled` never rejects,
+ * so every outcome (registered listener OR failure) is inspectable, letting
+ * the caller clean up whatever DID register and surface a real error instead
+ * of leaving the screen stuck (e.g. `isRunning` never reset).
+ */
+async function registerProgressListeners(setters: {
+  setFolderStatuses: (
+    update: (prev: Record<string, FolderStatus>) => Record<string, FolderStatus>
+  ) => void;
+  setFolderCurrentFile: (
+    update: (prev: Record<string, string>) => Record<string, string>
+  ) => void;
+  setFolderErrors: (
+    update: (prev: Record<string, string>) => Record<string, string>
+  ) => void;
+}): Promise<{ unlistenFns: UnlistenFn[]; errors: string[] }> {
+  const { setFolderStatuses, setFolderCurrentFile, setFolderErrors } = setters;
+
+  const listenerResults = await Promise.allSettled([
+    listen<SyncFolderStartPayload>("sync-folder-start", (event) => {
+      setFolderStatuses((prev) => ({
+        ...prev,
+        [event.payload.folder]: "running",
+      }));
+    }),
+    listen<SyncProgressPayload>("sync-progress", (event) => {
+      const { event: progressEvent, folder } = event.payload;
+      if (progressEvent.type === "Copying") {
+        setFolderCurrentFile((prev) => ({
+          ...prev,
+          [folder]: progressEvent.path,
+        }));
+      }
+    }),
+    listen<SyncFolderSuccessPayload>("sync-folder-success", (event) => {
+      setFolderStatuses((prev) => ({
+        ...prev,
+        [event.payload.folder]: "success",
+      }));
+    }),
+    listen<SyncFolderFailurePayload>("sync-folder-failure", (event) => {
+      setFolderStatuses((prev) => ({
+        ...prev,
+        [event.payload.folder]: "error",
+      }));
+      setFolderErrors((prev) => ({
+        ...prev,
+        [event.payload.folder]: event.payload.error,
+      }));
+    }),
+  ]);
+
+  const unlistenFns: UnlistenFn[] = [];
+  const errors: string[] = [];
+  for (const result of listenerResults) {
+    if (result.status === "fulfilled") {
+      unlistenFns.push(result.value);
+    } else {
+      errors.push(
+        result.reason instanceof Error
+          ? result.reason.message
+          : String(result.reason)
+      );
+    }
   }
+  return { errors, unlistenFns };
+}
 
-  if (itemRows.length > 0) {
-    await db.insert(runItems).values(itemRows);
+/**
+ * Invokes `run_backup`/`run_restore`, records the resolved `BatchOutcome`,
+ * and (best-effort) persists it. Pulled out of `handleStart` alongside
+ * `registerProgressListeners` above to keep that callback's cognitive
+ * complexity within lint limits -- the listener-setup-failure and
+ * batch-run-failure paths are independent concerns, so splitting them into
+ * separate functions mirrors that.
+ */
+async function runSyncBatchAndPersist(params: {
+  command: "run_backup" | "run_restore";
+  dest: string;
+  includedPaths: string[];
+  serial: string;
+  direction: Direction;
+  startedAt: Date;
+  setBatchOutcome: (outcome: BatchOutcome) => void;
+  setBatchError: (message: string) => void;
+  setPersistError: (message: string) => void;
+}): Promise<void> {
+  const {
+    command,
+    dest,
+    includedPaths,
+    serial,
+    direction,
+    startedAt,
+    setBatchOutcome,
+    setBatchError,
+    setPersistError,
+  } = params;
+
+  try {
+    // `run_backup`/`run_restore` (Task 10) return a `Promise<BatchOutcome>`
+    // that only resolves once the WHOLE batch is done -- live updates come
+    // from the event listeners `registerProgressListeners` sets up, which
+    // fire WHILE this await is still pending. The DB write below is
+    // deliberately anchored to THIS resolved promise rather than the
+    // `sync-batch-complete` event: both carry the identical `BatchOutcome`
+    // payload (Rust emits the event immediately before returning
+    // `Ok(outcome)` -- see `run_sync_batch` in `sync/orchestration.rs`), so
+    // listening to both would just be two races to do the same write. The
+    // promise resolution is the simpler, single-source trigger: it's
+    // guaranteed to fire exactly once, and it keeps the "kick off the run"
+    // and "record what happened" logic in the same function instead of
+    // splitting it across an event-callback boundary.
+    const outcome = await invoke<BatchOutcome>(command, {
+      dest,
+      includedPaths,
+      serial,
+    });
+    setBatchOutcome(outcome);
+    const finishedAt = new Date();
+    try {
+      await persistRunResult({
+        direction,
+        finishedAt,
+        outcome,
+        serial,
+        startedAt,
+      });
+    } catch (err) {
+      setPersistError(err instanceof Error ? err.message : String(err));
+    }
+  } catch (err) {
+    setBatchError(err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -342,77 +498,40 @@ export function RunScreen({
     setFolderErrors({});
 
     const startedAt = new Date();
-    const unlistenFns: UnlistenFn[] = await Promise.all([
-      listen<SyncFolderStartPayload>("sync-folder-start", (event) => {
-        setFolderStatuses((prev) => ({
-          ...prev,
-          [event.payload.folder]: "running",
-        }));
-      }),
-      listen<SyncProgressPayload>("sync-progress", (event) => {
-        const { event: progressEvent, folder } = event.payload;
-        if (progressEvent.type === "Copying") {
-          setFolderCurrentFile((prev) => ({
-            ...prev,
-            [folder]: progressEvent.path,
-          }));
-        }
-      }),
-      listen<SyncFolderSuccessPayload>("sync-folder-success", (event) => {
-        setFolderStatuses((prev) => ({
-          ...prev,
-          [event.payload.folder]: "success",
-        }));
-      }),
-      listen<SyncFolderFailurePayload>("sync-folder-failure", (event) => {
-        setFolderStatuses((prev) => ({
-          ...prev,
-          [event.payload.folder]: "error",
-        }));
-        setFolderErrors((prev) => ({
-          ...prev,
-          [event.payload.folder]: event.payload.error,
-        }));
-      }),
-    ]);
+
+    const { unlistenFns, errors: listenerErrors } =
+      await registerProgressListeners({
+        setFolderCurrentFile,
+        setFolderErrors,
+        setFolderStatuses,
+      });
+
+    if (listenerErrors.length > 0) {
+      // Clean up whatever DID register before bailing out so nothing leaks.
+      for (const unlisten of unlistenFns) {
+        unlisten();
+      }
+      setBatchError(
+        `Failed to set up progress listeners: ${listenerErrors.join("; ")}`
+      );
+      setIsRunning(false);
+      return;
+    }
+
     unlistenFnsRef.current = unlistenFns;
 
-    const command = direction === "backup" ? "run_backup" : "run_restore";
-
     try {
-      // `run_backup`/`run_restore` (Task 10) return a `Promise<BatchOutcome>`
-      // that only resolves once the WHOLE batch is done -- live updates come
-      // from the event listeners set up above, which fire WHILE this await
-      // is still pending. The DB write below is deliberately anchored to
-      // THIS resolved promise rather than the `sync-batch-complete` event:
-      // both carry the identical `BatchOutcome` payload (Rust emits the
-      // event immediately before returning `Ok(outcome)` -- see
-      // `run_sync_batch` in `sync/orchestration.rs`), so listening to both
-      // would just be two races to do the same write. The promise
-      // resolution is the simpler, single-source trigger: it's guaranteed
-      // to fire exactly once, and it keeps the "kick off the run" and
-      // "record what happened" logic in the same function instead of
-      // splitting it across an event-callback boundary.
-      const outcome = await invoke<BatchOutcome>(command, {
+      await runSyncBatchAndPersist({
+        command: direction === "backup" ? "run_backup" : "run_restore",
         dest,
+        direction,
         includedPaths,
         serial,
+        setBatchError,
+        setBatchOutcome,
+        setPersistError,
+        startedAt,
       });
-      setBatchOutcome(outcome);
-      const finishedAt = new Date();
-      try {
-        await persistRunResult({
-          direction,
-          finishedAt,
-          outcome,
-          serial,
-          startedAt,
-        });
-      } catch (err) {
-        setPersistError(err instanceof Error ? err.message : String(err));
-      }
-    } catch (err) {
-      setBatchError(err instanceof Error ? err.message : String(err));
     } finally {
       for (const unlisten of unlistenFns) {
         unlisten();
