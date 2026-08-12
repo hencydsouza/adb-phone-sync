@@ -108,6 +108,9 @@ export function ClassificationScreen({ serial }: ClassificationScreenProps) {
 
   const handleToggle = useCallback((name: string, checked: boolean) => {
     setIncluded((prev) => ({ ...prev, [name]: checked }));
+    // A post-save edit invalidates the "Selections saved" banner -- it would
+    // otherwise keep claiming the (now-stale) selection was saved.
+    setIsSaved(false);
   }, []);
 
   // No `folder_rules` persistence command exists yet (that's a later task —
