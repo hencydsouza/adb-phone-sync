@@ -1,0 +1,47 @@
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+
+export const devices = sqliteTable("devices", {
+  displayName: text("display_name").notNull(),
+  firstSeen: integer("first_seen", { mode: "timestamp" }).notNull(),
+  lastSeen: integer("last_seen", { mode: "timestamp" }).notNull(),
+  serial: text("serial").primaryKey(),
+});
+
+export const folderRules = sqliteTable("folder_rules", {
+  decision: text("decision", { enum: ["include", "skip"] }).notNull(),
+  deviceSerial: text("device_serial")
+    .notNull()
+    .references(() => devices.serial),
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  path: text("path").notNull(),
+  source: text("source", { enum: ["heuristic", "manual"] }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+});
+
+export const runs = sqliteTable("runs", {
+  deviceSerial: text("device_serial")
+    .notNull()
+    .references(() => devices.serial),
+  finishedAt: integer("finished_at", { mode: "timestamp" }),
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  startedAt: integer("started_at", { mode: "timestamp" }).notNull(),
+  status: text("status", {
+    enum: ["running", "completed", "failed", "cancelled"],
+  }).notNull(),
+  type: text("type", { enum: ["backup", "restore"] }).notNull(),
+});
+
+export const runItems = sqliteTable("run_items", {
+  bytesTransferred: integer("bytes_transferred"),
+  errorMessage: text("error_message"),
+  fileCount: integer("file_count"),
+  finishedAt: integer("finished_at", { mode: "timestamp" }),
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  path: text("path").notNull(),
+  runId: integer("run_id")
+    .notNull()
+    .references(() => runs.id),
+  status: text("status", {
+    enum: ["synced", "outdated", "broken", "skipped", "error"],
+  }).notNull(),
+});
