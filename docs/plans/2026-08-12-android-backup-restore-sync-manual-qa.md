@@ -143,10 +143,22 @@ debugging enabled and a nontrivial DCIM/Pictures/etc. folder structure.
         against `adb`'s actual `Input/output error` / `No space left on
         device` output on a real full disk. There is no string match for
         `Input/output error` or `No space left on device` anywhere in
-        `progress_parser.rs`; the safety net today is adb's own nonzero
-        exit code plus the "any stderr = failure" rule from `8877362`. This
-        item is genuinely unverified — budget real time for it and file a
-        bug if the real error text doesn't get classified as Error/Fatal.
+        `progress_parser.rs`. Note this was NOT actually covered by
+        `8877362` (that commit's "any stderr = failure on exit 0" hardening
+        only ever touched `space.rs`'s preflight `du -s` size estimate, not
+        this actual transfer path — a final whole-tree review caught that
+        this exact fix had never been ported over to `orchestration.rs`).
+        As of `246d267`, `determine_folder_outcome` in `orchestration.rs`
+        now applies the same "any non-empty stderr on a zero exit code is a
+        failure" rule directly (mirroring `space.rs`'s `interpret_du_exit`),
+        so real disk-full/IO-error text landing on stderr with a zero exit
+        code is no longer silently reported as `sync-folder-success` even
+        when `progress_parser.rs` doesn't recognize the specific wording.
+        That rule has unit test coverage (a literal `"No space left on
+        device"` fixture, verified to fail against the pre-fix logic) but,
+        like the `du -s` case below, zero real-device verification — this
+        item is still genuinely unverified end-to-end; budget real time for
+        it and file a bug if real disk-full behavior doesn't match.
 - [ ] **Cloud-sync destination warning.** Point a backup destination at a
       path inside a real OneDrive-synced folder. Confirm the "Destination is
       inside a cloud-synced folder" banner (`run-screen.tsx`, the
