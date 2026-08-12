@@ -58,6 +58,18 @@
 //!   rather than failing the whole command -- it's best-effort supplementary
 //!   data for one signal, not required for the top-level listing to
 //!   succeed.
+//! - **`gather_media_siblings` fans out with a bounded concurrency cap**
+//!   (see [`MEDIA_SIBLING_CONCURRENCY`]) instead of spawning every package's
+//!   `adb shell ls` unbounded or running them fully sequentially. A
+//!   well-populated phone can have 20-50+ packages under `Android/media`,
+//!   and awaiting those one at a time would add real latency to
+//!   `classify_suggest`. `tokio::task::JoinSet` (the `rt` feature is
+//!   already pulled in transitively by `tauri`/`sqlx`, and is now declared
+//!   directly in `Cargo.toml` too) lets a bounded batch of packages list
+//!   concurrently while keeping the existing per-package
+//!   best-effort/non-fatal error handling intact: each spawned task returns
+//!   a `Result`, and a failure or panic for one package still only drops
+//!   that package's sibling data, never the whole command.
 
 use std::time::Duration;
 
@@ -73,6 +85,15 @@ use crate::classify;
 const LS_TIMEOUT: Duration = Duration::from_secs(10);
 
 const STORAGE_ROOT: &str = "/storage/emulated/0";
+
+/// Cap on how many `Android/media/<pkg>` listings [`gather_media_siblings`]
+/// runs concurrently. Bounds subprocess fan-out (each one spawns a real
+/// `adb` sidecar process) while still cutting wall-clock latency
+/// dramatically versus a fully sequential walk on devices with many
+/// packages. Not tuned against a real many-package device -- chosen as a
+/// conservative middle ground between "no concurrency" and "unbounded
+/// concurrency".
+const MEDIA_SIBLING_CONCURRENCY: usize = 6;
 
 /// One entry from a parsed `ls -la` listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +234,15 @@ pub struct SuggestedFolder {
 /// separately because `classify::FolderEntry` doesn't carry a timestamp).
 /// Best-effort: a missing/unreadable `Android/media` or individual package
 /// folder just yields less sibling data, not an error.
+///
+/// Package listings are fanned out in batches of up to
+/// [`MEDIA_SIBLING_CONCURRENCY`] concurrent `adb shell ls` calls (via
+/// `tokio::task::JoinSet`) rather than one at a time, to keep
+/// `classify_suggest` responsive on devices with many packages under
+/// `Android/media`. A failed or panicking task for one package is caught
+/// and simply drops that package's sibling data -- it never fails the
+/// batch or the overall command, preserving the same non-fatal semantics
+/// the previous fully-sequential version had.
 async fn gather_media_siblings(
     app: &tauri::AppHandle,
     serial: &str,
@@ -225,19 +255,42 @@ async fn gather_media_siblings(
         return (siblings, sibling_mtimes);
     };
 
-    for pkg in parse_ls_la_output(&media_raw).into_iter().filter(|e| e.is_dir) {
-        let pkg_path = format!("{media_path}/{}", pkg.name);
-        let Ok(pkg_raw) = run_adb_shell_ls(app, serial, &pkg_path).await else {
-            continue;
-        };
-        for item in parse_ls_la_output(&pkg_raw) {
-            let full_path = format!("Android/media/{}/{}", pkg.name, item.name);
-            sibling_mtimes.push((full_path.clone(), item.mtime));
-            siblings.push(classify::FolderEntry {
-                name: full_path,
-                is_dir: item.is_dir,
-                is_empty: false,
+    let pkg_dirs: Vec<LsEntry> = parse_ls_la_output(&media_raw)
+        .into_iter()
+        .filter(|e| e.is_dir)
+        .collect();
+
+    for chunk in pkg_dirs.chunks(MEDIA_SIBLING_CONCURRENCY) {
+        let mut set = tokio::task::JoinSet::new();
+        for pkg in chunk {
+            let app = app.clone();
+            let serial = serial.to_string();
+            let pkg_path = format!("{media_path}/{}", pkg.name);
+            let pkg_name = pkg.name.clone();
+            set.spawn(async move {
+                let result = run_adb_shell_ls(&app, &serial, &pkg_path).await;
+                (pkg_name, result)
             });
+        }
+
+        while let Some(joined) = set.join_next().await {
+            // `joined` is `Err` only if the spawned task panicked -- treat
+            // that the same as a failed listing (best-effort, non-fatal).
+            let Ok((pkg_name, pkg_result)) = joined else {
+                continue;
+            };
+            let Ok(pkg_raw) = pkg_result else {
+                continue;
+            };
+            for item in parse_ls_la_output(&pkg_raw) {
+                let full_path = format!("Android/media/{pkg_name}/{}", item.name);
+                sibling_mtimes.push((full_path.clone(), item.mtime));
+                siblings.push(classify::FolderEntry {
+                    name: full_path,
+                    is_dir: item.is_dir,
+                    is_empty: false,
+                });
+            }
         }
     }
 
@@ -263,6 +316,12 @@ pub async fn classify_suggest(
         .filter(|entry| entry.is_dir && entry.name != "Android")
         .map(|entry| {
             let shadow_suffix = format!("/{}", entry.name);
+            // Bare lexicographic string comparison, relying on `LsEntry::mtime`
+            // being `"<date> <time>"` with zero-padded, fixed-width components
+            // (as toybox `ls -la` prints them -- see that field's doc comment).
+            // Holds for every real fixture captured so far; would need an
+            // actual date-parsing comparison if a non-zero-padded `ls`
+            // implementation were ever encountered.
             let is_newer_than_shadow = sibling_mtimes
                 .iter()
                 .find(|(path, _)| {
