@@ -24,7 +24,7 @@ export const db = drizzle(
     // `get` expects a single row (flattened, not wrapped in an outer array),
     // while `all`/`values` expect an array of rows.
     if (method === "get") {
-      return { rows: rows[0] ?? [] };
+      return { rows: rows[0] };
     }
 
     return { rows };
