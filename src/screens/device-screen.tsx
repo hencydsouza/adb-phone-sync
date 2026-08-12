@@ -23,30 +23,74 @@ function statusVariantForState(state: string): "success" | "warning" {
   return state === READY_STATE ? "success" : "warning";
 }
 
-export function DeviceScreen() {
+interface DeviceScreenProps {
+  /**
+   * Called when the user picks a device, in addition to the screen's own
+   * local selection state. Lets a parent (e.g. App) lift the selection for
+   * later screens to react to. Optional so the screen stays usable
+   * standalone/in tests.
+   */
+  onDeviceSelected?: (serial: string) => void;
+}
+
+export function DeviceScreen({ onDeviceSelected }: DeviceScreenProps = {}) {
   const [devices, setDevices] = useState<Device[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedSerial, setSelectedSerial] = useState<string | null>(null);
 
+  // Returns a cancellation function so callers (the mount effect, in
+  // particular) can guard against setting state after the component that
+  // triggered the fetch is no longer around to receive it.
   const loadDevices = useCallback(() => {
     setIsLoading(true);
     setError(null);
+    let cancelled = false;
+
     invoke<Device[]>("list_devices")
       .then((result) => {
+        if (cancelled) {
+          return;
+        }
         setDevices(result);
+        // Drop the selection if the previously-selected device is no longer
+        // present in the refreshed list.
+        setSelectedSerial((prev) =>
+          prev !== null && !result.some((device) => device.serial === prev)
+            ? null
+            : prev
+        );
       })
       .catch((err: unknown) => {
+        if (cancelled) {
+          return;
+        }
         setError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
+        if (cancelled) {
+          return;
+        }
         setIsLoading(false);
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    loadDevices();
+    const cancel = loadDevices();
+    return cancel;
   }, [loadDevices]);
+
+  const handleSelect = useCallback(
+    (serial: string) => {
+      setSelectedSerial(serial);
+      onDeviceSelected?.(serial);
+    },
+    [onDeviceSelected]
+  );
 
   if (error) {
     return (
@@ -90,7 +134,7 @@ export function DeviceScreen() {
             device={device}
             isSelected={device.serial === selectedSerial}
             key={device.serial}
-            onSelect={setSelectedSerial}
+            onSelect={handleSelect}
           />
         ))}
       </List>
