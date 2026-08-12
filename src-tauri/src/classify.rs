@@ -1,6 +1,6 @@
 /// A classification decision for a top-level (or shadow-checked) folder on
 /// the device, produced by [`classify`] / [`classify_with_mtime_hint`].
-#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Decision {
     /// Personal content — back it up.
     Include,
@@ -14,9 +14,22 @@ pub enum Decision {
 
 /// A single folder entry as reported by a device listing (e.g. `adb shell
 /// ls`). This module only classifies; it does not walk the device itself.
+///
+/// `name`'s expected shape depends on how the entry is used:
+/// - As the `entry` being classified, `name` is a bare top-level folder name
+///   (e.g. `"DCIM"`, `"WhatsApp"`).
+/// - As a member of the `siblings` list passed to [`classify`] /
+///   [`classify_with_mtime_hint`], `name` must be the full relative path
+///   (e.g. `"Android/media/com.whatsapp/WhatsApp"`) so the shadow-duplicate
+///   check can match it against `Android/media/<pkg>/<entry-name>`. A bare
+///   name in `siblings` will simply never match and is otherwise harmless.
 #[derive(Debug)]
 pub struct FolderEntry {
     pub name: String,
+    /// Reserved for future use: not yet consulted by [`classify`] /
+    /// [`classify_with_mtime_hint`]. Required today only because real
+    /// device-listing wiring (not yet implemented) will need it once this
+    /// module walks actual `adb shell ls -R` output.
     pub is_dir: bool,
     pub is_empty: bool,
 }
@@ -52,7 +65,10 @@ pub fn classify_with_mtime_hint(
     siblings: &[FolderEntry],
     is_newer_than_shadow: bool,
 ) -> Decision {
-    if ALWAYS_EXCLUDED_PREFIXES.iter().any(|p| entry.name.starts_with(p)) {
+    if ALWAYS_EXCLUDED_PREFIXES
+        .iter()
+        .any(|p| entry.name == *p || entry.name.starts_with(&format!("{p}/")))
+    {
         return Decision::Skip;
     }
     if PERSONAL_MEDIA.contains(&entry.name.as_str()) {
@@ -63,6 +79,11 @@ pub fn classify_with_mtime_hint(
     }
     // Stale-duplicate check: a top-level folder name that also appears as
     // `Android/media/<pkg>/<name>` is suspect — prefer whichever is newer.
+    // Note: this suffix match assumes the documented 2-level
+    // `Android/media/<pkg>/<name>` shape; it would also (incorrectly) match a
+    // deeper `Android/media/<pkg>/<subdir>/<name>` sibling. Low practical
+    // risk in observed device listings, but worth knowing if false positives
+    // show up once real device data is wired in.
     let shadow_suffix = format!("/{}", entry.name);
     let has_media_shadow = siblings
         .iter()
@@ -111,5 +132,23 @@ mod tests {
         let siblings = [entry("Android/media/com.whatsapp/WhatsApp", true, false)];
         let suggestion = classify_with_mtime_hint(&entry("WhatsApp", true, false), &siblings, false /* not newer */);
         assert_eq!(suggestion, Decision::SkipStaleDuplicate);
+    }
+
+    #[test]
+    fn unknown_folder_with_no_signal_defaults_to_include() {
+        // No structural signal either way: not personal media, not stock
+        // noise, not empty, no Android/media shadow. Locks in the reviewed
+        // scope decision to default to Include and let a human decide.
+        let suggestion = classify(&entry("SomeRandomAppFolder", true, false), &[]);
+        assert_eq!(suggestion, Decision::Include);
+    }
+
+    #[test]
+    fn newer_than_shadow_is_included_despite_matching_shadow() {
+        // root /WhatsApp is newer than (or equal to) the Android/media
+        // shadow copy, so it should NOT be flagged as a stale duplicate.
+        let siblings = [entry("Android/media/com.whatsapp/WhatsApp", true, false)];
+        let suggestion = classify_with_mtime_hint(&entry("WhatsApp", true, false), &siblings, true /* newer */);
+        assert_eq!(suggestion, Decision::Include);
     }
 }
