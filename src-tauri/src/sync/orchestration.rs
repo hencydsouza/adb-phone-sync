@@ -241,21 +241,38 @@ fn leaf_name(android_path: &str) -> &str {
 ///    during the drain, this reports the folder as failed using that
 ///    message.
 /// 2. Even when nothing was recognized by `parse_line` as a notable
-///    message, ANY non-empty `stderr_tail` on an exit-0 process is still
-///    treated as a failure. This mirrors `space.rs`'s `interpret_du_exit`
-///    (hardened in commit `8877362` after Task 13's review): toybox tools on
-///    Android (`du`, `ls`, and by extension whatever `adb`/`adbsync` shell
-///    out to) don't reliably turn a partial/failed operation into a
-///    non-zero exit code, so real failure text -- e.g. "No space left on
-///    device", "Input/output error" -- can land on stderr while the process
-///    still exits 0, and none of `progress_parser`'s patterns match that
-///    text. `8877362` only patched the preflight size-estimate path in
-///    `space.rs`; this is the actual transfer path, so it needs the same
-///    fallback (see commit that introduced this comment for the fix).
+///    message, `stderr_tail` on an exit-0 process is still inspected: if it
+///    contains any line that isn't one of `adbsync`'s own benign log
+///    levels, that's treated as a failure. This mirrors `space.rs`'s
+///    `interpret_du_exit` (hardened in commit `8877362` after Task 13's
+///    review): toybox tools on Android (`du`, `ls`, and by extension
+///    whatever `adb`/`adbsync` shell out to) don't reliably turn a
+///    partial/failed operation into a non-zero exit code, so real failure
+///    text -- e.g. "No space left on device", "Input/output error" -- can
+///    land on stderr while the process still exits 0, and none of
+///    `progress_parser`'s patterns match that text.
+///
+///    Confirmed by reading the vendored source
+///    (`third_party/better-adb-sync/src/BetterADBSync/SAOLogging.py`):
+///    `setup_root_logger` attaches a `logging.StreamHandler()` -- which
+///    defaults to **stderr** -- at level `INFO` by default
+///    (`10 * (2 + quietness_level - verbosity_level)`, i.e. `INFO` when
+///    both are `0`). So `adbsync` logs its own `[INFO]`/`[DEBUG]` tree-diff
+///    diagnostics to stderr on *every* run, not just failed ones -- e.g.
+///    `[INFO] Source tree: [INFO] ├.: (...) [INFO] └SGCAM_...json: (...)`.
+///    Treating ANY non-empty stderr as failure (the original hardening)
+///    reports every successful transfer as failed. Instead, only a line
+///    that is NOT prefixed `[INFO]`/`[DEBUG]` counts as notable -- this
+///    still catches `adbsync`'s own `[WARNING]`/`[ERROR]`/`[CRITICAL]`
+///    lines (belt-and-suspenders alongside `progress_parser`) and, more
+///    importantly, raw unprefixed text from `adb`/toybox itself (which
+///    never goes through this Python logging setup at all), while no
+///    longer choking on the tool's normal verbose diagnostics.
 ///
 /// Together these guarantee a partially-broken-but-zero-exit run never gets
 /// reported as `sync-folder-success` (design doc §5: never silently report
-/// success when something went wrong).
+/// success when something went wrong), without misreporting a clean run as
+/// failed just because `adbsync` logged its own progress to stderr.
 fn determine_folder_outcome(
     exit_code: Option<Option<i32>>,
     last_notable_message: Option<String>,
@@ -265,7 +282,7 @@ fn determine_folder_outcome(
     match exit_code {
         Some(Some(0)) => match last_notable_message {
             Some(message) => Err(message),
-            None if !stderr_tail.trim().is_empty() => Err(format!(
+            None if stderr_has_non_benign_content(stderr_tail) => Err(format!(
                 "adbsync {subcommand} exited 0 but reported errors on stderr (likely a \
                  partial/failed transfer): {}",
                 stderr_tail.trim()
@@ -285,6 +302,24 @@ fn determine_folder_outcome(
             )
         })),
     }
+}
+
+/// `adbsync`'s own `[INFO]`/`[DEBUG]`-prefixed log lines (see
+/// `determine_folder_outcome`'s doc comment for why these are expected on
+/// every run, not just failed ones). Any stderr line that doesn't match one
+/// of these prefixes -- including `adbsync`'s own `[WARNING]`/`[ERROR]`/
+/// `[CRITICAL]` lines and raw, unprefixed text from `adb`/toybox -- is
+/// treated as evidence of a real problem.
+const BENIGN_STDERR_LOG_PREFIXES: &[&str] = &["[INFO]", "[DEBUG]"];
+
+fn stderr_has_non_benign_content(stderr_tail: &str) -> bool {
+    stderr_tail.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty()
+            && !BENIGN_STDERR_LOG_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+    })
 }
 
 /// Real, subprocess-spawning [`FolderSyncRunner`]. Spawns the `adbsync`
@@ -415,7 +450,16 @@ impl RealFolderSyncRunner {
                     }
                     CommandEvent::Stderr(bytes) => {
                         let chunk = String::from_utf8_lossy(&bytes);
+                        // `chunk` arrives pre-split on its line terminator
+                        // (tauri-plugin-shell's pipe reader delivers one
+                        // event per `\n`/`\r`-terminated line, terminator
+                        // stripped) -- push a `\n` back in so `stderr_tail`
+                        // stays newline-delimited for
+                        // `stderr_has_non_benign_content`'s per-line check,
+                        // instead of concatenating every line into one
+                        // run-on blob with no separator.
                         stderr_tail.push_str(&chunk);
+                        stderr_tail.push('\n');
                         for line in stderr_splitter.push(&chunk) {
                             Self::handle_line(&self.app, folder, &line, &mut last_notable_message);
                         }
@@ -684,6 +728,55 @@ mod orchestration_tests {
         assert!(outcome.is_err());
         let message = outcome.unwrap_err();
         assert!(message.contains("No space left on device"));
+    }
+
+    #[test]
+    fn zero_exit_with_only_benign_info_log_lines_is_a_success() {
+        // Real regression, found via manual QA: `adbsync`'s own logging
+        // setup (`SAOLogging.py::setup_root_logger`) attaches a
+        // `logging.StreamHandler()` -- which defaults to stderr -- at level
+        // INFO by default, so a completely successful transfer still logs
+        // its tree-diff diagnostics to stderr on every run. The prior
+        // "any non-empty stderr on exit 0 = failure" rule reported every
+        // clean transfer as failed. This is the exact shape of real output
+        // captured during manual testing (`SGCAM` folder), reconstructed
+        // with the newline separators the accumulation-loop fix restores.
+        let stderr = "[INFO] Source tree:\n\
+                       [INFO] \u{251c}.: (1713617100, 1713617100)\n\
+                       [INFO] \u{2514}8.5.300\n\
+                       [INFO] \u{251c}.: (1713879720, 1713879720)\n\
+                       [INFO] \u{2514}LOGCAT\n";
+        let outcome = determine_folder_outcome(Some(Some(0)), None, stderr, "pull");
+        assert_eq!(outcome, Ok(()));
+    }
+
+    #[test]
+    fn zero_exit_with_a_warning_log_line_mixed_into_benign_info_lines_is_a_failure() {
+        // A `[WARNING]`/`[ERROR]`/`[CRITICAL]` line from adbsync's own
+        // logger is not benign, even sitting alongside otherwise-normal
+        // `[INFO]` tree-diff output.
+        let stderr = "[INFO] Source tree:\n[WARNING] something looked wrong\n";
+        let outcome = determine_folder_outcome(Some(Some(0)), None, stderr, "pull");
+        assert!(outcome.is_err());
+        assert!(outcome.unwrap_err().contains("[WARNING] something looked wrong"));
+    }
+
+    #[test]
+    fn stderr_has_non_benign_content_ignores_info_and_debug_prefixed_lines() {
+        assert!(!stderr_has_non_benign_content(
+            "[INFO] a\n[DEBUG] b\n[INFO] c\n"
+        ));
+        assert!(!stderr_has_non_benign_content(""));
+        assert!(!stderr_has_non_benign_content("\n\n  \n"));
+    }
+
+    #[test]
+    fn stderr_has_non_benign_content_flags_anything_else() {
+        assert!(stderr_has_non_benign_content("[INFO] a\n[ERROR] b\n"));
+        assert!(stderr_has_non_benign_content("No space left on device"));
+        assert!(stderr_has_non_benign_content(
+            "[INFO] a\nsome unprefixed raw error text\n"
+        ));
     }
 
     #[test]
