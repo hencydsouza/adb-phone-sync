@@ -33,8 +33,50 @@ pub fn parse_adb_devices_output(raw: &str) -> Vec<Device> {
         .collect()
 }
 
+/// How many times to retry `adb devices -l` if it fails specifically
+/// because the adb server was mid-restart, and how long to wait between
+/// attempts. Found via manual QA: when another adb installation (e.g.
+/// Android Studio's bundled adb) is also running on this machine, our
+/// bundled `adb.exe` can detect a server-version mismatch on startup, kill
+/// the existing daemon, and restart its own — a real, normally-brief race
+/// during which `adb devices` fails with `"daemon not running... could not
+/// read ok from ADB Server... failed to start daemon... cannot connect to
+/// daemon"`. This is not a bug in our command construction (confirmed: the
+/// error text is `adb`'s own, verbatim) and not something a fixed timeout
+/// bound can rule out ahead of time -- it's inherently racy, so retrying
+/// after a short delay (rather than surfacing the error to the user
+/// immediately) mirrors what re-plugging the device was doing anyway: just
+/// giving the daemon restart enough time to finish.
+const DAEMON_RESTART_RETRY_ATTEMPTS: u32 = 3;
+const DAEMON_RESTART_RETRY_DELAY: Duration = Duration::from_millis(1500);
+
+/// Whether an error looks like the daemon-restart race described above,
+/// rather than some other failure (missing sidecar, genuinely no device,
+/// unrelated adb error) that retrying the exact same command wouldn't fix.
+fn is_daemon_restart_race(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("cannot connect to daemon")
+        || lower.contains("failed to start daemon")
+        || lower.contains("daemon not running")
+}
+
 #[tauri::command]
 pub async fn list_devices(app: tauri::AppHandle) -> Result<Vec<Device>, String> {
+    let mut last_error = String::new();
+    for attempt in 0..DAEMON_RESTART_RETRY_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(DAEMON_RESTART_RETRY_DELAY).await;
+        }
+        match run_adb_devices_once(&app).await {
+            Ok(devices) => return Ok(devices),
+            Err(err) if is_daemon_restart_race(&err) => last_error = err,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error)
+}
+
+async fn run_adb_devices_once(app: &tauri::AppHandle) -> Result<Vec<Device>, String> {
     // NOTE: the `shell:allow-execute` scope entry in capabilities/default.json
     // only gates shell invocations initiated from frontend JS through the
     // shell plugin's JS API. It does not gate this Rust-side
@@ -115,6 +157,23 @@ pub async fn list_devices(app: tauri::AppHandle) -> Result<Vec<Device>, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_daemon_restart_race_recognizes_the_real_error_text() {
+        // Exact text from the manual QA report this retry was added for.
+        let real_error = "adb devices exited with code Some(1): * daemon not running; \
+            starting now at tcp:5037 could not read ok from ADB Server * failed to start \
+            daemon adb.exe: failed to check server version: cannot connect to daemon";
+        assert!(is_daemon_restart_race(real_error));
+    }
+
+    #[test]
+    fn is_daemon_restart_race_does_not_match_unrelated_errors() {
+        assert!(!is_daemon_restart_race("timed out waiting for `adb devices` to respond"));
+        assert!(!is_daemon_restart_race(
+            "adb devices exited with code Some(1): unauthorized"
+        ));
+    }
 
     #[test]
     fn parses_adb_devices_dash_l_output() {
