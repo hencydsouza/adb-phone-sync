@@ -81,6 +81,38 @@ interface RunScreenProps {
   serial?: string;
 }
 
+const MAX_ERROR_CAUSE_DEPTH = 5;
+
+/** `Error.cause` is ES2022+; this project's `tsconfig.json` targets ES2020,
+ * so read it via an index-signature cast rather than bumping the global lib
+ * target for one call site. */
+function errorCause(err: Error): unknown {
+  return (err as unknown as { cause?: unknown }).cause;
+}
+
+/**
+ * `err.message` alone drops the real root cause for a `DrizzleQueryError`
+ * (e.g. from `persistRunResult`'s `db.transaction()`): drizzle-orm sets
+ * `this.cause = <the original proxy-callback error>` on top of its own
+ * generic `"Failed query: ..."` message (see `node_modules/drizzle-orm/errors.js`).
+ * Walk the `.cause` chain so the underlying error -- the one that actually
+ * explains *why* a query failed -- is never silently dropped from what the
+ * user sees.
+ */
+function describeError(err: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = err;
+  for (let depth = 0; depth < MAX_ERROR_CAUSE_DEPTH && current; depth += 1) {
+    const message =
+      current instanceof Error ? current.message : String(current);
+    if (!parts.includes(message)) {
+      parts.push(message);
+    }
+    current = current instanceof Error ? errorCause(current) : undefined;
+  }
+  return parts.join(" — caused by: ");
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) {
     return `${bytes} B`;
@@ -380,10 +412,10 @@ async function runSyncBatchAndPersist(params: {
         startedAt,
       });
     } catch (err) {
-      setPersistError(err instanceof Error ? err.message : String(err));
+      setPersistError(describeError(err));
     }
   } catch (err) {
-    setBatchError(err instanceof Error ? err.message : String(err));
+    setBatchError(describeError(err));
   }
 }
 
@@ -439,7 +471,7 @@ export function RunScreen({
           return;
         }
         setSpaceCheck(null);
-        setSpaceCheckError(err instanceof Error ? err.message : String(err));
+        setSpaceCheckError(describeError(err));
       })
       .finally(() => {
         if (spaceCheckGenerationRef.current !== generation) {
