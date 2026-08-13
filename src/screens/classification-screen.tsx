@@ -40,17 +40,36 @@ function decisionSummary(decision: Decision): string {
   }
 }
 
+/**
+ * Mirrors `device_scan::STORAGE_ROOT` (`src-tauri/src/device_scan.rs`).
+ * `classify_suggest` returns bare top-level folder names; this screen must
+ * turn them back into full ANDROID-side paths for `RunScreen`'s
+ * `includedPaths`, which expects the same absolute-path shape
+ * `sync::orchestration` works with.
+ */
+const STORAGE_ROOT = "/storage/emulated/0";
+
 interface ClassificationScreenProps {
   /**
+   * Called with the full ANDROID-side paths of every currently-included
+   * folder when the user saves their selections. Optional so the screen
+   * stays usable standalone/in tests. This does not persist anything (no
+   * `folder_rules` command exists yet, see the comment on `handleSave`) —
+   * it only lets a parent (e.g. App) carry the selection forward to
+   * `RunScreen`.
+   */
+  onSaved?: (includedPaths: string[]) => void;
+  /**
    * The device serial to scan, e.g. lifted from `DeviceScreen`'s
-   * `onDeviceSelected` seam (see `src/App.tsx`). Not wired to that seam yet
-   * — this task only builds the screen itself; routing between screens is a
-   * later concern.
+   * `onDeviceSelected` seam (see `src/app.tsx`).
    */
   serial: string;
 }
 
-export function ClassificationScreen({ serial }: ClassificationScreenProps) {
+export function ClassificationScreen({
+  serial,
+  onSaved,
+}: ClassificationScreenProps) {
   const [suggestions, setSuggestions] = useState<SuggestedFolder[]>([]);
   const [included, setIncluded] = useState<Record<string, boolean>>({});
   const [isLoading, setIsLoading] = useState(true);
@@ -116,10 +135,16 @@ export function ClassificationScreen({ serial }: ClassificationScreenProps) {
   // No `folder_rules` persistence command exists yet (that's a later task —
   // see the design doc's `profile_save` concept). This is a local-state-only
   // placeholder seam: it just confirms the reviewed list in the UI instead
-  // of writing anything to SQLite.
+  // of writing anything to SQLite. `onSaved` carries the selection forward
+  // to whichever screen the user navigates to next (App.tsx), independent
+  // of that missing persistence.
   const handleSave = useCallback(() => {
     setIsSaved(true);
-  }, []);
+    const includedPaths = suggestions
+      .filter((folder) => included[folder.name])
+      .map((folder) => `${STORAGE_ROOT}/${folder.name}`);
+    onSaved?.(includedPaths);
+  }, [included, suggestions, onSaved]);
 
   if (error) {
     return (
